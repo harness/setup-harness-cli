@@ -8,29 +8,36 @@ import * as https from 'https';
 import * as os from 'os';
 import * as path from 'path';
 
-const HC_VERSION_RE = /^v?\d+(\.[\w-]+)*$/;
+const CLI_REPO = 'harness/cli';
+const CLI_VERSION_RE = /^v?\d+(\.[\w-]+)*$/;
 
-/** Env var used as a within-job marker so hc is only installed once per job. */
-export const MARKER_HC_VERSION = 'SETUP_HC_VERSION';
+/** Env var used as a within-job marker so the CLI is only installed once per job. */
+export const MARKER_CLI_VERSION = 'SETUP_HARNESS_CLI_VERSION';
 
-export function normalizeHcVersion(version: string): string {
+export interface InstalledCli {
+  version: string;
+  harnessPath: string;
+  cliHome: string;
+}
+
+export function normalizeCliVersion(version: string): string {
   const trimmed = version.trim();
-  if (!HC_VERSION_RE.test(trimmed)) {
+  if (!CLI_VERSION_RE.test(trimmed)) {
     throw new Error(
-      `Invalid hc-version "${trimmed}". Expected a release tag like v1.3.43`,
+      `Invalid cli-version "${trimmed}". Expected a release tag like v3.12.0`,
     );
   }
   return trimmed.startsWith('v') ? trimmed : `v${trimmed}`;
 }
 
 export function versionsMatch(versionOutput: string, expected: string): boolean {
-  const want = normalizeHcVersion(expected).replace(/^v/, '');
-  const match = versionOutput.match(/hc version\s+(v?[\w.-]+)/i);
+  const want = normalizeCliVersion(expected).replace(/^v/, '');
+  const match = versionOutput.match(/harness version\s+(v?[\w.-]+)/i);
   if (!match) return false;
   return match[1].replace(/^v/, '') === want;
 }
 
-export function fetchLatestHcVersion(githubToken?: string): Promise<string> {
+export function fetchLatestCliVersion(githubToken?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {
       'User-Agent': 'setup-harness-cli',
@@ -41,7 +48,7 @@ export function fetchLatestHcVersion(githubToken?: string): Promise<string> {
     }
     const options = {
       hostname: 'api.github.com',
-      path: '/repos/harness/harness-cli/releases/latest',
+      path: `/repos/${CLI_REPO}/releases/latest`,
       headers,
     };
     https.get(options, (res) => {
@@ -66,36 +73,50 @@ export function fetchLatestHcVersion(githubToken?: string): Promise<string> {
   });
 }
 
-export async function resolveHcVersion(requested: string, githubToken?: string): Promise<string> {
+export async function resolveCliVersion(requested: string, githubToken?: string): Promise<string> {
   const trimmed = requested.trim().toLowerCase();
   if (!trimmed || trimmed === 'latest') {
-    core.info('Resolving latest hc version from GitHub...');
-    const tag = await fetchLatestHcVersion(githubToken);
-    core.info(`Latest hc version: ${tag}`);
+    core.info('Resolving latest Harness CLI version from GitHub...');
+    const tag = await fetchLatestCliVersion(githubToken);
+    core.info(`Latest Harness CLI version: ${tag}`);
     return tag;
   }
-  return normalizeHcVersion(requested);
-}
-
-function resolveInstallDir(): string {
-  const base = process.env.RUNNER_TEMP || os.tmpdir();
-  return path.join(base, 'setup-harness-cli-hc');
-}
-
-function cacheKey(version: string): string {
-  return `setup-hc-${version}-${os.platform()}-${os.arch()}`;
+  return normalizeCliVersion(requested);
 }
 
 function mapPlatform(platform: string): string {
+  if (platform === 'linux') return 'linux';
   if (platform === 'darwin') return 'darwin';
   if (platform === 'win32') return 'windows';
-  return 'linux';
+  throw new Error(`Unsupported platform: ${platform}. Supported: linux, darwin, win32`);
 }
 
 function mapArch(arch: string): string {
-  if (arch === 'x64') return 'x86_64';
+  if (arch === 'x64') return 'amd64';
   if (arch === 'arm64') return 'arm64';
   throw new Error(`Unsupported architecture: ${arch}. Supported: x64, arm64`);
+}
+
+function exeName(name: string): string {
+  return os.platform() === 'win32' ? `${name}.exe` : name;
+}
+
+/**
+ * The harness binary lives in <root>/bin and the CLI home (plugins, specs,
+ * config, credentials) in <root>/home, so the cache can hold the binaries
+ * and plugin without ever picking up credentials.
+ */
+function resolvePaths(): { binDir: string; cliHome: string } {
+  const root = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'setup-harness-cli');
+  return { binDir: path.join(root, 'bin'), cliHome: path.join(root, 'home') };
+}
+
+function cachePaths(binDir: string, cliHome: string): string[] {
+  return [binDir, path.join(cliHome, 'bin'), path.join(cliHome, 'spec')];
+}
+
+function cacheKey(version: string): string {
+  return `setup-harness-cli-${version}-${os.platform()}-${os.arch()}`;
 }
 
 function hashFile(filePath: string): Promise<string> {
@@ -108,17 +129,17 @@ function hashFile(filePath: string): Promise<string> {
   });
 }
 
-async function isHcOnPath(): Promise<boolean> {
-  const exitCode = await exec.exec('which', ['hc'], {
-    ignoreReturnCode: true,
-    silent: true,
-  });
-  return exitCode === 0;
+function findChecksum(checksums: string, assetName: string): string | undefined {
+  for (const line of checksums.split('\n')) {
+    const [hash, name] = line.trim().split(/\s+/);
+    if (name && name.replace(/^\*/, '') === assetName) return hash;
+  }
+  return undefined;
 }
 
-async function readHcVersionOutput(): Promise<string> {
+async function readVersionOutput(harnessPath: string): Promise<string> {
   let stdout = '';
-  const exitCode = await exec.exec('hc', ['version'], {
+  const exitCode = await exec.exec(harnessPath, ['version'], {
     ignoreReturnCode: true,
     silent: true,
     listeners: { stdout: (data: Buffer) => { stdout += data.toString(); } },
@@ -126,29 +147,28 @@ async function readHcVersionOutput(): Promise<string> {
   return exitCode === 0 ? stdout : '';
 }
 
-async function installHc(version: string, installDir: string): Promise<void> {
+async function installCli(version: string, binDir: string, harnessPath: string): Promise<void> {
   const platform = mapPlatform(os.platform());
   const arch = mapArch(os.arch());
   const ver = version.replace(/^v/, '');
-  const assetName = `hc_${ver}_${platform}_${arch}.tar.gz`;
-  const baseUrl = `https://github.com/harness/harness-cli/releases/download/${version}`;
+  const ext = platform === 'windows' ? 'zip' : 'tar.gz';
+  const assetName = `harness-bundle_${ver}_${platform}_${arch}.${ext}`;
+  const checksumsName = `harness_${ver}_checksums.txt`;
+  const baseUrl = `https://github.com/${CLI_REPO}/releases/download/${version}`;
 
-  core.info(`Downloading hc ${version} (${platform}/${arch})...`);
+  core.info(`Downloading Harness CLI ${version} (${platform}/${arch})...`);
 
-  // Download tarball and checksums concurrently
-  const [tarPath, checksumsPath] = await Promise.all([
+  const [archivePath, checksumsPath] = await Promise.all([
     tc.downloadTool(`${baseUrl}/${assetName}`),
-    tc.downloadTool(`${baseUrl}/checksums.txt`),
+    tc.downloadTool(`${baseUrl}/${checksumsName}`),
   ]);
 
-  // Verify SHA-256 before executing anything
-  const checksums = fs.readFileSync(checksumsPath, 'utf8');
-  const expectedLine = checksums.split('\n').find((l) => l.includes(assetName));
-  if (!expectedLine) {
-    throw new Error(`No checksum entry found for ${assetName} in checksums.txt`);
+  // Verify SHA-256 before executing anything from the archive
+  const expectedHash = findChecksum(fs.readFileSync(checksumsPath, 'utf8'), assetName);
+  if (!expectedHash) {
+    throw new Error(`No checksum entry found for ${assetName} in ${checksumsName}`);
   }
-  const expectedHash = expectedLine.trim().split(/\s+/)[0];
-  const actualHash = await hashFile(tarPath);
+  const actualHash = await hashFile(archivePath);
   if (actualHash !== expectedHash) {
     throw new Error(
       `SHA-256 mismatch for ${assetName}: expected ${expectedHash}, got ${actualHash}`,
@@ -156,52 +176,54 @@ async function installHc(version: string, installDir: string): Promise<void> {
   }
   core.info(`SHA-256 verified for ${assetName}`);
 
-  // Extract and add to PATH
-  await fs.promises.mkdir(installDir, { recursive: true });
-  await tc.extractTar(tarPath, installDir);
-  core.addPath(installDir);
+  const extractDir = ext === 'zip'
+    ? await tc.extractZip(archivePath)
+    : await tc.extractTar(archivePath);
+
+  await fs.promises.mkdir(binDir, { recursive: true });
+  await fs.promises.copyFile(path.join(extractDir, exeName('harness')), harnessPath);
+  await fs.promises.chmod(harnessPath, 0o755);
+
+  const pluginSource = path.join(extractDir, exeName('harness-har'));
+  const exitCode = await exec.exec(harnessPath, ['install', 'plugin', pluginSource], {
+    ignoreReturnCode: true,
+  });
+  if (exitCode !== 0) {
+    throw new Error(`harness install plugin failed (exit ${exitCode}) for ${pluginSource}`);
+  }
 }
 
 /**
- * Ensures hc is installed and on PATH exactly once per job.
- * Uses SETUP_HC_VERSION as a job-scoped marker (set via core.exportVariable)
- * so repeated calls within the same job are instant no-ops.
+ * Ensures the harness CLI and its har plugin are installed exactly once per job.
+ * Uses SETUP_HARNESS_CLI_VERSION as a job-scoped marker so repeated calls
+ * within the same job are instant no-ops.
  */
-export async function ensureHc(requestedVersion = '', githubToken?: string): Promise<string> {
-  const version = await resolveHcVersion(requestedVersion, githubToken);
+export async function ensureCli(requestedVersion = '', githubToken?: string): Promise<InstalledCli> {
+  const version = await resolveCliVersion(requestedVersion, githubToken);
+  const { binDir, cliHome } = resolvePaths();
+  const harnessPath = path.join(binDir, exeName('harness'));
+  const pluginPath = path.join(cliHome, 'bin', exeName('harness-har'));
 
-  // Within-job marker: if this version was already installed in an earlier step, skip everything.
-  const marker = process.env[MARKER_HC_VERSION];
-  if (marker === version) {
-    core.info(`hc ${version} already installed in this job, skipping`);
-    return version;
+  core.exportVariable('HARNESS_CLI_HOME', cliHome);
+  core.exportVariable('HARNESS_NO_UPDATE_CHECK', '1');
+  core.addPath(binDir);
+
+  if (process.env[MARKER_CLI_VERSION] === version && fs.existsSync(pluginPath)) {
+    core.info(`Harness CLI ${version} already installed in this job, skipping`);
+    return { version, harnessPath, cliHome };
   }
 
-  const installDir = resolveInstallDir();
-
-  if (await isHcOnPath()) {
-    const current = await readHcVersionOutput();
-    if (current && versionsMatch(current, version)) {
-      core.info(`hc ${version} already on PATH, skipping install`);
-      core.exportVariable(MARKER_HC_VERSION, version);
-      return version;
-    }
-    core.info(
-      `hc on PATH does not match ${version} (got: ${current.trim() || 'unknown'}); reinstalling`,
-    );
-  }
-
+  const paths = cachePaths(binDir, cliHome);
   const key = cacheKey(version);
-  const cacheHit = await cache.restoreCache([installDir], key);
+  const cacheHit = await cache.restoreCache(paths, key);
   if (cacheHit) {
-    core.info(`Restored hc ${version} from cache`);
-    core.addPath(installDir);
+    core.info(`Restored Harness CLI ${version} from cache`);
   } else {
-    await installHc(version, installDir);
+    await installCli(version, binDir, harnessPath);
     try {
-      const cacheId = await cache.saveCache([installDir], key);
+      const cacheId = await cache.saveCache(paths, key);
       if (cacheId !== -1) {
-        core.info(`Saved hc ${version} to cache`);
+        core.info(`Saved Harness CLI ${version} to cache`);
       }
     } catch (e) {
       // Cache save failures are non-fatal — next job will just reinstall
@@ -209,14 +231,17 @@ export async function ensureHc(requestedVersion = '', githubToken?: string): Pro
     }
   }
 
-  const installed = await readHcVersionOutput();
+  const installed = await readVersionOutput(harnessPath);
   if (!installed || !versionsMatch(installed, version)) {
     throw new Error(
-      `hc install completed but version mismatch: expected ${version}, got: ${installed.trim() || '(no output)'}`,
+      `Harness CLI install completed but version mismatch: expected ${version}, got: ${installed.trim() || '(no output)'}`,
     );
   }
+  if (!fs.existsSync(pluginPath)) {
+    throw new Error(`Harness CLI ${version} installed, but the har plugin is missing at ${pluginPath}`);
+  }
 
-  core.info(`Using hc ${version}`);
-  core.exportVariable(MARKER_HC_VERSION, version);
-  return version;
+  core.info(`Using Harness CLI ${version} with the har plugin`);
+  core.exportVariable(MARKER_CLI_VERSION, version);
+  return { version, harnessPath, cliHome };
 }

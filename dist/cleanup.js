@@ -25685,29 +25685,59 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(7484));
 const exec = __importStar(__nccwpck_require__(5236));
+const fs = __importStar(__nccwpck_require__(9896));
+const path = __importStar(__nccwpck_require__(6928));
+const state_1 = __nccwpck_require__(2462);
 async function cleanup() {
+    const harnessPath = core.getState(state_1.STATE_HARNESS_PATH);
+    const cliHome = core.getState(state_1.STATE_CLI_HOME);
+    if (!harnessPath || !cliHome) {
+        core.info('Harness CLI was not set up in this step; nothing to clean up');
+        return;
+    }
     try {
         core.info('Removing Harness CLI authentication...');
-        const exitCode = await exec.exec('hc', ['auth', 'logout'], {
+        const exitCode = await exec.exec(harnessPath, ['auth', 'logout'], {
             ignoreReturnCode: true,
             silent: true,
+            env: { ...process.env, HARNESS_CLI_HOME: cliHome },
         });
         if (exitCode !== 0) {
-            core.info('hc auth logout returned non-zero; credentials may already be cleared');
+            core.info('harness auth logout returned non-zero; credentials may already be cleared');
         }
         else {
             core.info('Harness CLI credentials removed');
         }
     }
     catch (err) {
-        // Non-fatal — runner will be recycled; just log and move on
-        core.info(`Cleanup skipped: ${err}`);
+        core.info(`Logout skipped: ${err}`);
+    }
+    // Logout can fail if the binary is gone, so also delete the credentials file directly.
+    try {
+        fs.rmSync(path.join(cliHome, 'credentials'), { force: true });
+    }
+    catch (err) {
+        core.info(`Could not remove credentials file: ${err}`);
     }
 }
 /* istanbul ignore next */
 if (require.main === require.cache[eval('__filename')]) {
     cleanup();
 }
+
+
+/***/ }),
+
+/***/ 2462:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.STATE_CLI_HOME = exports.STATE_HARNESS_PATH = void 0;
+/** Keys saved by the main step and read by the post-step cleanup. */
+exports.STATE_HARNESS_PATH = 'harness-path';
+exports.STATE_CLI_HOME = 'cli-home';
 
 
 /***/ }),

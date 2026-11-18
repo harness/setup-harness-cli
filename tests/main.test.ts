@@ -1,27 +1,25 @@
 export {};
 
-import * as crypto from 'crypto';
-
 const mockGetInput = jest.fn();
 const mockSetOutput = jest.fn();
 const mockSetFailed = jest.fn();
 const mockSetSecret = jest.fn();
+const mockSaveState = jest.fn();
 const mockInfo = jest.fn();
 const mockStartGroup = jest.fn();
 const mockEndGroup = jest.fn();
-const mockAddPath = jest.fn();
 const mockExportVariable = jest.fn();
 
 jest.mock('@actions/core', () => ({
-  getInput:        mockGetInput,
-  setOutput:       mockSetOutput,
-  setFailed:       mockSetFailed,
-  setSecret:       mockSetSecret,
-  info:            mockInfo,
-  startGroup:      mockStartGroup,
-  endGroup:        mockEndGroup,
-  addPath:         mockAddPath,
-  exportVariable:  mockExportVariable,
+  getInput:       mockGetInput,
+  setOutput:      mockSetOutput,
+  setFailed:      mockSetFailed,
+  setSecret:      mockSetSecret,
+  saveState:      mockSaveState,
+  info:           mockInfo,
+  startGroup:     mockStartGroup,
+  endGroup:       mockEndGroup,
+  exportVariable: mockExportVariable,
 }));
 
 const mockExec = jest.fn();
@@ -29,51 +27,13 @@ jest.mock('@actions/exec', () => ({
   exec: mockExec,
 }));
 
-jest.mock('@actions/cache', () => ({
-  restoreCache: jest.fn().mockResolvedValue(undefined),
-  saveCache:    jest.fn().mockResolvedValue(0),
+const HARNESS = '/runner/temp/setup-harness-cli/bin/harness';
+const CLI_HOME = '/runner/temp/setup-harness-cli/home';
+const mockEnsureCli = jest.fn();
+jest.mock('../src/install', () => ({
+  ensureCli: (...args: unknown[]) => mockEnsureCli(...args),
+  MARKER_CLI_VERSION: 'SETUP_HARNESS_CLI_VERSION',
 }));
-
-jest.mock('@actions/tool-cache', () => ({
-  downloadTool: jest.fn().mockResolvedValue('/tmp/mock-download'),
-  extractTar:   jest.fn().mockResolvedValue('/tmp/mock-extract'),
-}));
-
-const mockReadFileSync = jest.fn();
-const mockCreateReadStream = jest.fn();
-
-jest.mock('fs', () => ({
-  ...jest.requireActual('fs'),
-  promises:         { mkdir: jest.fn().mockResolvedValue(undefined) },
-  readFileSync:     (...args: unknown[]) => mockReadFileSync(...args),
-  createReadStream: (...args: unknown[]) => mockCreateReadStream(...args),
-}));
-
-jest.mock('https', () => ({ get: jest.fn() }));
-
-// Pin platform/arch so asset names are deterministic across dev and CI
-jest.mock('os', () => ({
-  ...jest.requireActual('os'),
-  platform: () => 'linux',
-  arch:     () => 'x64',
-  tmpdir:   () => '/tmp',
-}));
-
-// Pre-compute a consistent mock binary hash for checksum tests
-const MOCK_BINARY = Buffer.from('mock hc binary content');
-const MOCK_HASH = crypto.createHash('sha256').update(MOCK_BINARY).digest('hex');
-const MOCK_CHECKSUMS_143 = `${MOCK_HASH}  hc_1.3.43_linux_x86_64.tar.gz\n`;
-
-function mockHashableStream() {
-  const stream = {
-    on(event: string, handler: any) {
-      if (event === 'data') setImmediate(() => handler(MOCK_BINARY));
-      if (event === 'end') setImmediate(() => handler());
-      return stream; // chainable: .on(...).on(...).on(...)
-    },
-  };
-  mockCreateReadStream.mockReturnValue(stream);
-}
 
 async function runModule(): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -85,168 +45,122 @@ const INPUTS: Record<string, string> = {
   'api-url':      'https://app.harness.io',
   'account':      'acc-123',
   'token':        'pat.acc-123.secret',
-  'hc-version':   'v1.3.43',
+  'org':          'my-org',
+  'project':      'my-project',
+  'cli-version':  'v3.12.0',
   'github-token': '',
 };
+
+const ENV_VARS = ['HARNESS_URL', 'HARNESS_ACCOUNT_ID', 'HARNESS_PAT_TOKEN', 'HARNESS_ORG_ID', 'HARNESS_PROJECT_ID'];
 
 function setupInputMock(overrides: Record<string, string> = {}) {
   const merged = { ...INPUTS, ...overrides };
   mockGetInput.mockImplementation((name: string) => merged[name] ?? '');
 }
 
-/**
- * Happy-path exec mock for orchestration tests.
- * Install is skipped via SETUP_HC_VERSION marker, so only hc auth and hc version run.
- */
-function mockExecHappyPath(versionOutput = 'hc version 1.3.43\n') {
-  mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-    if (cmd === 'hc' && args[0] === 'version') {
+function mockExecHappyPath(versionOutput = 'harness version 3.12.0 (202611010000Z)\n') {
+  mockExec.mockImplementation(async (_cmd: string, args: string[], opts: any) => {
+    if (args[0] === 'version') {
       opts?.listeners?.stdout?.(Buffer.from(versionOutput));
-      return 0;
     }
-    if (cmd === 'hc' && args[0] === 'auth') return 0;
     return 0;
   });
+}
+
+function authCall() {
+  return mockExec.mock.calls.find((c: any[]) => c[1][0] === 'auth');
 }
 
 beforeEach(() => {
   jest.resetModules();
   jest.clearAllMocks();
-  delete process.env.SETUP_HC_VERSION;
-  delete process.env.SETUP_HC_LOGGED_IN;
-  // Harness CI pods inject HARNESS_ORG_ID/HARNESS_PROJECT_ID; src/index.ts
-  // forwards them as --org/--project to `hc auth login`, which breaks the
-  // strict arg assertions below. Clear them for hermetic tests.
-  delete process.env.HARNESS_ORG_ID;
-  delete process.env.HARNESS_PROJECT_ID;
-  // Skip install by default in orchestration tests; install.test.ts covers installHc thoroughly
-  process.env.SETUP_HC_VERSION = 'v1.3.43';
-  // Reset cache mock after resetModules
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const cacheMock = require('@actions/cache');
-  cacheMock.restoreCache = jest.fn().mockResolvedValue(undefined);
-  cacheMock.saveCache    = jest.fn().mockResolvedValue(0);
+  delete process.env.SETUP_HARNESS_LOGGED_IN;
+  // Harness CI pods inject HARNESS_ORG_ID/HARNESS_PROJECT_ID; clear them for hermetic tests.
+  for (const name of ENV_VARS) delete process.env[name];
+  mockEnsureCli.mockResolvedValue({ version: 'v3.12.0', harnessPath: HARNESS, cliHome: CLI_HOME });
 });
 
 describe('main orchestration', () => {
-  test('installs hc, logs in, sets hc-version output', async () => {
+  test('installs the CLI, logs in with scope, sets cli-version output', async () => {
     setupInputMock();
     mockExecHappyPath();
 
     await runModule();
 
-    const authCall = mockExec.mock.calls.find(
-      (c: any[]) => c[0] === 'hc' && c[1][0] === 'auth',
-    );
-    expect(authCall[1]).toEqual([
+    expect(mockEnsureCli).toHaveBeenCalledWith('v3.12.0', '');
+    expect(authCall()[0]).toBe(HARNESS);
+    expect(authCall()[1]).toEqual([
       'auth', 'login',
       '--api-url', 'https://app.harness.io',
       '--account', 'acc-123',
       '--api-token', 'pat.acc-123.secret',
-      '--non-interactive',
+      '--org', 'my-org',
+      '--project', 'my-project',
+      '--overwrite',
     ]);
-    expect(authCall[2]).toEqual(expect.objectContaining({ silent: true }));
-    expect(mockSetOutput).toHaveBeenCalledWith('hc-version', 'v1.3.43');
+    expect(authCall()[2]).toEqual(expect.objectContaining({ silent: true }));
+    expect(mockSaveState).toHaveBeenCalledWith('harness-path', HARNESS);
+    expect(mockSaveState).toHaveBeenCalledWith('cli-home', CLI_HOME);
+    expect(mockSetOutput).toHaveBeenCalledWith('cli-version', 'v3.12.0');
     expect(mockSetFailed).not.toHaveBeenCalled();
   });
 
-  test('sets install and login markers after first run', async () => {
-    // Clear the marker so the full install path runs
-    delete process.env.SETUP_HC_VERSION;
-    setupInputMock();
-    mockReadFileSync.mockReturnValue(MOCK_CHECKSUMS_143);
-    mockHashableStream();
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      if (cmd === 'hc' && args[0] === 'auth') return 0;
-      return 0;
-    });
+  test.each([
+    ['org', 'HARNESS_ORG_ID'],
+    ['project', 'HARNESS_PROJECT_ID'],
+  ])('fails before installing when %s is missing', async (input, envName) => {
+    setupInputMock({ [input]: '' });
 
     await runModule();
 
-    expect(mockExportVariable).toHaveBeenCalledWith('SETUP_HC_VERSION', 'v1.3.43');
-    expect(mockExportVariable).toHaveBeenCalledWith('SETUP_HC_LOGGED_IN', 'https://app.harness.io');
+    expect(mockSetFailed).toHaveBeenCalledWith(expect.stringContaining(envName));
+    expect(mockEnsureCli).not.toHaveBeenCalled();
   });
 
-  test('skips install when SETUP_HC_VERSION marker is set', async () => {
-    // marker already set by beforeEach
+  test('skips login when marker matches the same url, account, org and project', async () => {
     setupInputMock();
-    mockExecHappyPath();
-
-    await runModule();
-
-    expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('already installed in this job'));
-    expect(mockSetFailed).not.toHaveBeenCalled();
-  });
-
-  test('skips login when SETUP_HC_LOGGED_IN marker matches api-url', async () => {
-    setupInputMock();
-    process.env.SETUP_HC_LOGGED_IN = 'https://app.harness.io';
+    process.env.SETUP_HARNESS_LOGGED_IN = 'https://app.harness.io|acc-123|my-org|my-project';
     mockExecHappyPath();
 
     await runModule();
 
     expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('Already logged in'));
-    expect(mockStartGroup).not.toHaveBeenCalled();
+    expect(authCall()).toBeUndefined();
   });
 
-  test('does not skip login when api-url differs', async () => {
-    setupInputMock({ 'api-url': 'https://staging.harness.io' });
-    // marker was set for prod, but now we're talking to staging
-    process.env.SETUP_HC_LOGGED_IN = 'https://app.harness.io';
+  test('logs in again when the project changes within a job', async () => {
+    setupInputMock({ project: 'other-project' });
+    process.env.SETUP_HARNESS_LOGGED_IN = 'https://app.harness.io|acc-123|my-org|my-project';
     mockExecHappyPath();
 
     await runModule();
 
-    expect(mockStartGroup).toHaveBeenCalledWith('hc auth login');
-    expect(mockSetFailed).not.toHaveBeenCalled();
-  });
-
-  test('verifies hc is usable after setup (health check)', async () => {
-    setupInputMock();
-    mockExecHappyPath();
-
-    await runModule();
-
-    // hc version must be called as part of health check
-    const versionCalls = mockExec.mock.calls.filter(
-      (c: any[]) => c[0] === 'hc' && c[1][0] === 'version',
+    expect(mockStartGroup).toHaveBeenCalledWith('harness auth login');
+    expect(mockExportVariable).toHaveBeenCalledWith(
+      'SETUP_HARNESS_LOGGED_IN', 'https://app.harness.io|acc-123|my-org|other-project',
     );
-    expect(versionCalls.length).toBeGreaterThanOrEqual(1);
-    expect(mockSetFailed).not.toHaveBeenCalled();
   });
 
-  test('fails if hc is not usable after setup', async () => {
+  test('fails if harness is not usable after setup', async () => {
     setupInputMock();
-    process.env.SETUP_HC_LOGGED_IN = 'https://app.harness.io';
-    mockExec.mockImplementation(async (cmd: string, args: string[]) => {
-      if (cmd === 'hc' && args[0] === 'version') return 1; // health check fails
-      return 0;
-    });
+    mockExec.mockImplementation(async (_cmd: string, args: string[]) => (args[0] === 'version' ? 1 : 0));
 
     await runModule();
 
     expect(mockSetFailed).toHaveBeenCalledWith(
-      expect.stringContaining('hc is not usable after setup'),
+      expect.stringContaining('Harness CLI is not usable after setup'),
     );
   });
 
-  test('masks token before any exec call', async () => {
+  test('masks token before installing or running anything', async () => {
     setupInputMock();
     const callOrder: string[] = [];
     mockSetSecret.mockImplementation(() => { callOrder.push('setSecret'); });
-    mockExec.mockImplementation(async (cmd: string, _args: string[], opts: any) => {
-      callOrder.push(cmd);
-      if (cmd === 'hc') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      return 0;
+    mockEnsureCli.mockImplementation(async () => {
+      callOrder.push('ensureCli');
+      return { version: 'v3.12.0', harnessPath: HARNESS, cliHome: CLI_HOME };
     });
+    mockExecHappyPath();
 
     await runModule();
 
@@ -261,19 +175,13 @@ describe('main orchestration', () => {
     await runModule();
 
     expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('--api-token ***'));
-    expect(mockInfo).not.toHaveBeenCalledWith(
-      expect.stringContaining('pat.acc-123.secret'),
-    );
+    expect(mockInfo).not.toHaveBeenCalledWith(expect.stringContaining('pat.acc-123.secret'));
   });
 
   test('login failure calls setFailed and closes group', async () => {
     setupInputMock();
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      if (cmd === 'hc' && args[0] === 'auth') {
+    mockExec.mockImplementation(async (_cmd: string, args: string[], opts: any) => {
+      if (args[0] === 'auth') {
         opts?.listeners?.stdout?.(Buffer.from('authentication failed 401'));
         return 1;
       }
@@ -282,32 +190,23 @@ describe('main orchestration', () => {
 
     await runModule();
 
-    expect(mockSetFailed).toHaveBeenCalledWith(
-      expect.stringContaining('hc auth login failed'),
-    );
+    expect(mockSetFailed).toHaveBeenCalledWith(expect.stringContaining('harness auth login failed'));
     expect(mockEndGroup).toHaveBeenCalled();
   });
 
   test('uses env vars when action inputs are empty', async () => {
-    mockGetInput.mockImplementation((name: string) =>
-      name === 'hc-version' ? 'v1.3.43' : '',
-    );
+    mockGetInput.mockReturnValue('');
     process.env.HARNESS_URL        = 'https://env.harness.io';
     process.env.HARNESS_ACCOUNT_ID = 'acc-env';
     process.env.HARNESS_PAT_TOKEN  = 'pat.env.token';
+    process.env.HARNESS_ORG_ID     = 'env-org';
+    process.env.HARNESS_PROJECT_ID = 'env-project';
     mockExecHappyPath();
 
     await runModule();
 
-    delete process.env.HARNESS_URL;
-    delete process.env.HARNESS_ACCOUNT_ID;
-    delete process.env.HARNESS_PAT_TOKEN;
-
     expect(mockSetSecret).toHaveBeenCalledWith('pat.env.token');
-    const authCall = mockExec.mock.calls.find(
-      (c: any[]) => c[0] === 'hc' && c[1][0] === 'auth',
-    );
-    expect(authCall[1]).toContain('https://env.harness.io');
+    expect(authCall()[1]).toEqual(expect.arrayContaining(['https://env.harness.io', 'env-org', 'env-project']));
     expect(mockSetFailed).not.toHaveBeenCalled();
   });
 
@@ -318,67 +217,14 @@ describe('main orchestration', () => {
 
     await runModule();
 
-    delete process.env.HARNESS_PAT_TOKEN;
-
     expect(mockSetSecret).toHaveBeenCalledWith('pat.acc-123.secret');
   });
 
   test('fails when neither input nor env var provides token', async () => {
     mockGetInput.mockReturnValue('');
-    delete process.env.HARNESS_PAT_TOKEN;
 
     await runModule();
 
-    expect(mockSetFailed).toHaveBeenCalledWith(
-      expect.stringContaining('HARNESS_PAT_TOKEN'),
-    );
-  });
-
-  test('resolves latest version when hc-version is "latest"', async () => {
-    setupInputMock({ 'hc-version': 'latest' });
-    // After resolving latest → v2.0.0, the marker must match to skip install
-    process.env.SETUP_HC_VERSION = 'v2.0.0';
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const https = require('https');
-    https.get.mockImplementation((_opts: any, cb: any) => {
-      const res = {
-        statusCode: 200,
-        on: (event: string, handler: any) => {
-          if (event === 'data') handler(JSON.stringify({ tag_name: 'v2.0.0' }));
-          if (event === 'end') handler();
-          return res;
-        },
-      };
-      cb(res);
-      return { on: jest.fn() };
-    });
-    mockExecHappyPath('hc version 2.0.0\n');
-
-    await runModule();
-
-    expect(mockSetOutput).toHaveBeenCalledWith('hc-version', 'v2.0.0');
-    expect(mockSetFailed).not.toHaveBeenCalled();
-  });
-
-  test('downloads, verifies and extracts when no marker or cache', async () => {
-    delete process.env.SETUP_HC_VERSION;
-    setupInputMock();
-    mockReadFileSync.mockReturnValue(MOCK_CHECKSUMS_143);
-    mockHashableStream();
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      if (cmd === 'hc' && args[0] === 'auth') return 0;
-      return 0;
-    });
-
-    await runModule();
-
-    expect(mockSetOutput).toHaveBeenCalledWith('hc-version', 'v1.3.43');
-    expect(mockSetFailed).not.toHaveBeenCalled();
-    expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('SHA-256 verified'));
+    expect(mockSetFailed).toHaveBeenCalledWith(expect.stringContaining('HARNESS_PAT_TOKEN'));
   });
 });

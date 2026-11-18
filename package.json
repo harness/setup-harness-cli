@@ -1,6 +1,6 @@
 {
   "name": "setup-harness-cli",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "GitHub Action to install and authenticate the Harness CLI",
   "main": "dist/index.js",
   "scripts": {

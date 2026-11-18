@@ -1,6 +1,7 @@
 export {};
 
 import * as crypto from 'crypto';
+import * as path from 'path';
 
 const mockInfo = jest.fn();
 const mockAddPath = jest.fn();
@@ -10,8 +11,13 @@ const mockRestoreCache = jest.fn();
 const mockSaveCache = jest.fn();
 const mockDownloadTool = jest.fn();
 const mockExtractTar = jest.fn();
+const mockExtractZip = jest.fn();
 const mockReadFileSync = jest.fn();
 const mockCreateReadStream = jest.fn();
+const mockExistsSync = jest.fn();
+const mockCopyFile = jest.fn();
+let mockPlatform = 'linux';
+let mockArch = 'x64';
 
 jest.mock('@actions/core', () => ({
   info:           (...args: unknown[]) => mockInfo(...args),
@@ -32,39 +38,49 @@ jest.mock('@actions/cache', () => ({
 jest.mock('@actions/tool-cache', () => ({
   downloadTool: (...args: unknown[]) => mockDownloadTool(...args),
   extractTar:   (...args: unknown[]) => mockExtractTar(...args),
+  extractZip:   (...args: unknown[]) => mockExtractZip(...args),
 }));
 
 jest.mock('fs', () => ({
   ...jest.requireActual('fs'),
-  promises:         { mkdir: jest.fn().mockResolvedValue(undefined) },
+  promises: {
+    mkdir:    jest.fn().mockResolvedValue(undefined),
+    copyFile: (...args: unknown[]) => mockCopyFile(...args),
+    chmod:    jest.fn().mockResolvedValue(undefined),
+  },
   readFileSync:     (...args: unknown[]) => mockReadFileSync(...args),
   createReadStream: (...args: unknown[]) => mockCreateReadStream(...args),
+  existsSync:       (...args: unknown[]) => mockExistsSync(...args),
 }));
 
 jest.mock('https', () => ({ get: jest.fn() }));
 
-// Pin platform/arch so asset names are deterministic across dev and CI
 jest.mock('os', () => ({
   ...jest.requireActual('os'),
-  platform: () => 'linux',
-  arch:     () => 'x64',
+  platform: () => mockPlatform,
+  arch:     () => mockArch,
   tmpdir:   () => '/tmp',
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { normalizeHcVersion, versionsMatch, resolveHcVersion, ensureHc } = require('../src/install');
+const { normalizeCliVersion, versionsMatch, resolveCliVersion, ensureCli } = require('../src/install');
 
-// Pre-compute a consistent mock binary hash for checksum tests
-const MOCK_BINARY = Buffer.from('mock hc binary content');
-const MOCK_HASH = crypto.createHash('sha256').update(MOCK_BINARY).digest('hex');
+const RUNNER_TEMP = '/runner/temp';
+const BIN_DIR = path.join(RUNNER_TEMP, 'setup-harness-cli', 'bin');
+const CLI_HOME = path.join(RUNNER_TEMP, 'setup-harness-cli', 'home');
+const HARNESS = path.join(BIN_DIR, 'harness');
+const LINUX_BUNDLE = 'harness-bundle_3.12.0_linux_amd64.tar.gz';
 
-/** Makes createReadStream emit MOCK_BINARY so hashFile() returns MOCK_HASH. */
+const MOCK_ARCHIVE = Buffer.from('mock harness bundle');
+const MOCK_HASH = crypto.createHash('sha256').update(MOCK_ARCHIVE).digest('hex');
+
+/** Makes createReadStream emit MOCK_ARCHIVE so hashFile() returns MOCK_HASH. */
 function mockHashableStream() {
   const stream = {
     on(event: string, handler: any) {
-      if (event === 'data') setImmediate(() => handler(MOCK_BINARY));
+      if (event === 'data') setImmediate(() => handler(MOCK_ARCHIVE));
       if (event === 'end') setImmediate(() => handler());
-      return stream; // chainable: .on(...).on(...).on(...)
+      return stream;
     },
   };
   mockCreateReadStream.mockReturnValue(stream);
@@ -87,73 +103,85 @@ function mockGithubLatest(statusCode: number, body: string) {
   });
 }
 
+/** harness version prints `versionOutput`; install plugin exits with `pluginExit`. */
+function mockHarnessExec(versionOutput = 'harness version 3.12.0 (202611010000Z)\n', pluginExit = 0) {
+  mockExec.mockImplementation(async (_cmd: string, args: string[], opts: any) => {
+    if (args[0] === 'version') {
+      opts?.listeners?.stdout?.(Buffer.from(versionOutput));
+      return 0;
+    }
+    if (args[0] === 'install' && args[1] === 'plugin') return pluginExit;
+    throw new Error(`unexpected: ${args}`);
+  });
+}
+
+function pluginInstallCalls() {
+  return mockExec.mock.calls.filter((c: any[]) => c[1][0] === 'install');
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
-  delete process.env.RUNNER_TEMP;
-  delete process.env.SETUP_HC_VERSION;
+  mockPlatform = 'linux';
+  mockArch = 'x64';
+  process.env.RUNNER_TEMP = RUNNER_TEMP;
+  delete process.env.SETUP_HARNESS_CLI_VERSION;
   mockRestoreCache.mockResolvedValue(undefined);
   mockSaveCache.mockResolvedValue(0);
   mockDownloadTool.mockResolvedValue('/tmp/mock-download');
   mockExtractTar.mockResolvedValue('/tmp/mock-extract');
+  mockExtractZip.mockResolvedValue('/tmp/mock-extract');
+  mockCopyFile.mockResolvedValue(undefined);
+  mockExistsSync.mockReturnValue(true);
+  mockReadFileSync.mockReturnValue(
+    `0000000000000000000000000000000000000000000000000000000000000000  harness-core_3.12.0_linux_amd64.tar.gz\n` +
+    `${MOCK_HASH}  ${LINUX_BUNDLE}\n`,
+  );
+  mockHashableStream();
 });
 
-describe('normalizeHcVersion', () => {
+describe('normalizeCliVersion', () => {
   test('adds leading v when missing', () => {
-    expect(normalizeHcVersion('1.3.43')).toBe('v1.3.43');
+    expect(normalizeCliVersion('3.12.0')).toBe('v3.12.0');
   });
 
   test('keeps leading v', () => {
-    expect(normalizeHcVersion('v1.3.43')).toBe('v1.3.43');
+    expect(normalizeCliVersion('v3.12.0')).toBe('v3.12.0');
   });
 
   test('rejects shell metacharacters', () => {
-    expect(() => normalizeHcVersion('v1.3.43; rm -rf /')).toThrow(/Invalid hc-version/);
-    expect(() => normalizeHcVersion('$(reboot)')).toThrow(/Invalid hc-version/);
+    expect(() => normalizeCliVersion('v3.12.0; rm -rf /')).toThrow(/Invalid cli-version/);
+    expect(() => normalizeCliVersion('$(reboot)')).toThrow(/Invalid cli-version/);
   });
 });
 
 describe('versionsMatch', () => {
-  test('matches hc version output without leading v', () => {
-    expect(versionsMatch('hc version 1.3.43\nBuilt with go1.22\n', 'v1.3.43')).toBe(true);
-  });
-
-  test('matches when expected omits v', () => {
-    expect(versionsMatch('hc version 1.3.43\n', '1.3.43')).toBe(true);
+  test('matches harness version output', () => {
+    expect(versionsMatch('harness version 3.12.0 (202611010000Z)\n', 'v3.12.0')).toBe(true);
   });
 
   test('rejects mismatch', () => {
-    expect(versionsMatch('hc version 1.2.0\n', 'v1.3.43')).toBe(false);
+    expect(versionsMatch('harness version 3.11.0 (x)\n', 'v3.12.0')).toBe(false);
   });
 
-  test('rejects unparseable output', () => {
-    expect(versionsMatch('not a version', 'v1.3.43')).toBe(false);
+  test('rejects output from the old hc binary', () => {
+    expect(versionsMatch('hc version 3.12.0\n', 'v3.12.0')).toBe(false);
   });
 });
 
-describe('resolveHcVersion', () => {
+describe('resolveCliVersion', () => {
   test('returns normalized version when explicit tag given', async () => {
-    await expect(resolveHcVersion('1.3.43')).resolves.toBe('v1.3.43');
+    await expect(resolveCliVersion('3.12.0')).resolves.toBe('v3.12.0');
   });
 
-  test('fetches latest from GitHub when "latest" given', async () => {
-    mockGithubLatest(200, JSON.stringify({ tag_name: 'v2.0.0' }));
-    await expect(resolveHcVersion('latest')).resolves.toBe('v2.0.0');
-  });
-
-  test('fetches latest when empty string given', async () => {
-    mockGithubLatest(200, JSON.stringify({ tag_name: 'v2.0.0' }));
-    await expect(resolveHcVersion('')).resolves.toBe('v2.0.0');
-  });
-
-  test('passes github-token as Bearer when provided', async () => {
+  test('fetches latest from the harness/cli repo', async () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const https = require('https');
-    mockGithubLatest(200, JSON.stringify({ tag_name: 'v2.0.0' }));
+    mockGithubLatest(200, JSON.stringify({ tag_name: 'v3.12.0' }));
 
-    await resolveHcVersion('latest', 'ghs_test_token');
-
+    await expect(resolveCliVersion('latest', 'ghs_test_token')).resolves.toBe('v3.12.0');
     expect(https.get).toHaveBeenCalledWith(
       expect.objectContaining({
+        path: '/repos/harness/cli/releases/latest',
         headers: expect.objectContaining({ Authorization: 'Bearer ghs_test_token' }),
       }),
       expect.any(Function),
@@ -162,133 +190,143 @@ describe('resolveHcVersion', () => {
 
   test('fails clearly on non-200 GitHub API responses', async () => {
     mockGithubLatest(403, '{"message":"API rate limit exceeded"}');
-    await expect(resolveHcVersion('latest')).rejects.toThrow(
+    await expect(resolveCliVersion('')).rejects.toThrow(
       /GitHub API \/releases\/latest returned 403/,
     );
   });
 });
 
-describe('ensureHc', () => {
-  test('skips install when SETUP_HC_VERSION marker matches', async () => {
-    process.env.SETUP_HC_VERSION = 'v1.3.43';
+describe('ensureCli', () => {
+  test('exports CLI home and adds bin dir to PATH', async () => {
+    mockHarnessExec();
+    await ensureCli('v3.12.0');
 
-    const version = await ensureHc('v1.3.43');
+    expect(mockExportVariable).toHaveBeenCalledWith('HARNESS_CLI_HOME', CLI_HOME);
+    expect(mockExportVariable).toHaveBeenCalledWith('HARNESS_NO_UPDATE_CHECK', '1');
+    expect(mockAddPath).toHaveBeenCalledWith(BIN_DIR);
+  });
 
-    expect(version).toBe('v1.3.43');
-    expect(mockDownloadTool).not.toHaveBeenCalled();
+  test('skips install when marker matches and plugin is present', async () => {
+    process.env.SETUP_HARNESS_CLI_VERSION = 'v3.12.0';
+
+    const result = await ensureCli('v3.12.0');
+
+    expect(result).toEqual({ version: 'v3.12.0', harnessPath: HARNESS, cliHome: CLI_HOME });
+    expect(mockRestoreCache).not.toHaveBeenCalled();
     expect(mockExec).not.toHaveBeenCalled();
-    expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('already installed in this job'));
   });
 
-  test('skips install when PATH hc matches requested version', async () => {
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 0;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      throw new Error(`unexpected: ${cmd} ${args}`);
-    });
+  test('reinstalls when marker matches but plugin is missing', async () => {
+    process.env.SETUP_HARNESS_CLI_VERSION = 'v3.12.0';
+    mockExistsSync.mockReturnValueOnce(false);
+    mockHarnessExec();
 
-    const version = await ensureHc('v1.3.43');
+    await ensureCli('v3.12.0');
 
-    expect(version).toBe('v1.3.43');
-    expect(mockDownloadTool).not.toHaveBeenCalled();
-    expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('already on PATH'));
-    expect(mockExportVariable).toHaveBeenCalledWith('SETUP_HC_VERSION', 'v1.3.43');
+    expect(mockDownloadTool).toHaveBeenCalled();
   });
 
-  test('restores from cache — no download', async () => {
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      throw new Error(`unexpected: ${cmd} ${args}`);
-    });
-    mockRestoreCache.mockResolvedValue('setup-hc-v1.3.43-linux-x64');
+  test('restores binary and plugin from cache without downloading', async () => {
+    mockHarnessExec();
+    mockRestoreCache.mockResolvedValue('setup-harness-cli-v3.12.0-linux-x64');
 
-    await ensureHc('v1.3.43');
+    await ensureCli('v3.12.0');
 
+    expect(mockRestoreCache).toHaveBeenCalledWith(
+      [BIN_DIR, path.join(CLI_HOME, 'bin'), path.join(CLI_HOME, 'spec')],
+      'setup-harness-cli-v3.12.0-linux-x64',
+    );
     expect(mockDownloadTool).not.toHaveBeenCalled();
-    expect(mockAddPath).toHaveBeenCalled();
     expect(mockSaveCache).not.toHaveBeenCalled();
-    expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('Restored'));
   });
 
-  test('downloads, verifies SHA-256, extracts on cache miss', async () => {
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      throw new Error(`unexpected: ${cmd} ${args}`);
-    });
-    // checksums.txt contains the hash of our mock binary
-    mockReadFileSync.mockReturnValue(`${MOCK_HASH}  hc_1.3.43_linux_x86_64.tar.gz\n`);
-    mockHashableStream();
+  test('downloads the bundle, verifies it, installs harness and the har plugin', async () => {
+    mockHarnessExec();
 
-    await ensureHc('v1.3.43');
+    await ensureCli('v3.12.0');
 
-    expect(mockDownloadTool).toHaveBeenCalledTimes(2); // tarball + checksums
-    expect(mockDownloadTool).toHaveBeenCalledWith(
-      expect.stringContaining('hc_1.3.43_linux_x86_64.tar.gz'),
+    const base = 'https://github.com/harness/cli/releases/download/v3.12.0';
+    expect(mockDownloadTool).toHaveBeenCalledWith(`${base}/${LINUX_BUNDLE}`);
+    expect(mockDownloadTool).toHaveBeenCalledWith(`${base}/harness_3.12.0_checksums.txt`);
+    expect(mockExtractTar).toHaveBeenCalledWith('/tmp/mock-download');
+    expect(mockCopyFile).toHaveBeenCalledWith(path.join('/tmp/mock-extract', 'harness'), HARNESS);
+    expect(pluginInstallCalls()[0].slice(0, 2)).toEqual([
+      HARNESS, ['install', 'plugin', path.join('/tmp/mock-extract', 'harness-har')],
+    ]);
+    expect(mockSaveCache).toHaveBeenCalledWith(
+      [BIN_DIR, path.join(CLI_HOME, 'bin'), path.join(CLI_HOME, 'spec')],
+      'setup-harness-cli-v3.12.0-linux-x64',
     );
+    expect(mockExportVariable).toHaveBeenCalledWith('SETUP_HARNESS_CLI_VERSION', 'v3.12.0');
+  });
+
+  test('uses the zip bundle and .exe binaries on Windows', async () => {
+    mockPlatform = 'win32';
+    mockArch = 'arm64';
+    mockReadFileSync.mockReturnValue(`${MOCK_HASH}  harness-bundle_3.12.0_windows_arm64.zip\n`);
+    mockHarnessExec();
+
+    const result = await ensureCli('v3.12.0');
+
     expect(mockDownloadTool).toHaveBeenCalledWith(
-      expect.stringContaining('checksums.txt'),
+      expect.stringContaining('harness-bundle_3.12.0_windows_arm64.zip'),
     );
-    expect(mockExtractTar).toHaveBeenCalled();
-    expect(mockSaveCache).toHaveBeenCalled();
-    expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('SHA-256 verified'));
+    expect(mockExtractZip).toHaveBeenCalled();
+    expect(mockExtractTar).not.toHaveBeenCalled();
+    expect(result.harnessPath).toBe(path.join(BIN_DIR, 'harness.exe'));
+    expect(pluginInstallCalls()[0][1][2]).toBe(path.join('/tmp/mock-extract', 'harness-har.exe'));
   });
 
-  test('rejects tampered binary (SHA-256 mismatch)', async () => {
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      return 0;
-    });
-    // checksums.txt has a different hash than what the binary produces
-    mockReadFileSync.mockReturnValue(`deadbeef00000000000000000000000000000000000000000000000000000000  hc_1.3.43_linux_x86_64.tar.gz\n`);
-    mockHashableStream();
+  test('rejects a tampered bundle before running anything from it', async () => {
+    mockReadFileSync.mockReturnValue(`${'ab'.repeat(32)}  ${LINUX_BUNDLE}\n`);
+    mockHarnessExec();
 
-    await expect(ensureHc('v1.3.43')).rejects.toThrow(/SHA-256 mismatch/);
+    await expect(ensureCli('v3.12.0')).rejects.toThrow(/SHA-256 mismatch/);
+    expect(mockExtractTar).not.toHaveBeenCalled();
+    expect(pluginInstallCalls()).toHaveLength(0);
   });
 
-  test('fails if post-install version does not match', async () => {
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 9.9.9\n'));
-        return 0;
-      }
-      return 0;
-    });
-    mockReadFileSync.mockReturnValue(`${MOCK_HASH}  hc_1.3.43_linux_x86_64.tar.gz\n`);
-    mockHashableStream();
+  test('fails when the checksums file has no entry for the bundle', async () => {
+    mockReadFileSync.mockReturnValue(`${MOCK_HASH}  ${LINUX_BUNDLE}.sig\n`);
+    mockHarnessExec();
 
-    await expect(ensureHc('v1.3.43')).rejects.toThrow(/version mismatch/);
+    await expect(ensureCli('v3.12.0')).rejects.toThrow(/No checksum entry found/);
+  });
+
+  test('fails when plugin install fails', async () => {
+    mockHarnessExec(undefined, 1);
+
+    await expect(ensureCli('v3.12.0')).rejects.toThrow(/harness install plugin failed/);
+    expect(mockSaveCache).not.toHaveBeenCalled();
+  });
+
+  test('fails if installed version does not match', async () => {
+    mockHarnessExec('harness version 9.9.9 (x)\n');
+
+    await expect(ensureCli('v3.12.0')).rejects.toThrow(/version mismatch/);
+  });
+
+  test('fails if the har plugin is missing after install', async () => {
+    mockExistsSync.mockReturnValue(false);
+    mockHarnessExec();
+
+    await expect(ensureCli('v3.12.0')).rejects.toThrow(/har plugin is missing/);
+  });
+
+  test('rejects unsupported architectures', async () => {
+    mockArch = 'ia32';
+    mockHarnessExec();
+
+    await expect(ensureCli('v3.12.0')).rejects.toThrow(/Unsupported architecture/);
   });
 
   test('continues if cache save fails', async () => {
-    mockExec.mockImplementation(async (cmd: string, args: string[], opts: any) => {
-      if (cmd === 'which') return 1;
-      if (cmd === 'hc' && args[0] === 'version') {
-        opts?.listeners?.stdout?.(Buffer.from('hc version 1.3.43\n'));
-        return 0;
-      }
-      return 0;
-    });
-    mockReadFileSync.mockReturnValue(`${MOCK_HASH}  hc_1.3.43_linux_x86_64.tar.gz\n`);
-    mockHashableStream();
+    mockHarnessExec();
     mockSaveCache.mockRejectedValue(new Error('cache quota exceeded'));
 
-    await expect(ensureHc('v1.3.43')).resolves.toBe('v1.3.43');
+    await expect(ensureCli('v3.12.0')).resolves.toEqual(
+      expect.objectContaining({ version: 'v3.12.0' }),
+    );
     expect(mockInfo).toHaveBeenCalledWith(expect.stringContaining('Cache save skipped'));
   });
 });

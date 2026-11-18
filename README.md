@@ -43,12 +43,12 @@ steps:
     project: my-project
 
 - run: harness push artifact:generic my-registry/my-app build.tar.gz --version 1.0.0
-- run: harness push artifact:python my-registry/my_pkg dist/my_pkg-1.0.0-py3-none-any.whl
-- run: harness push artifact:npm my-registry/my-pkg my-pkg-1.0.0.tgz
-- run: harness push artifact:rpm my-registry/my-package package.rpm
+- run: harness push artifact:python my-registry dist/my_pkg-1.0.0-py3-none-any.whl
+- run: harness push artifact:npm my-registry my-pkg-1.0.0.tgz
+- run: harness push artifact:rpm my-registry package.rpm
 ```
 
-Run `harness push artifact:<type> --help` for the flags each package type supports.
+Generic artifacts take `<registry>/<name>`. Package types such as Python, npm, and RPM take only the registry, because the name and version come from the package file. Run `harness push artifact:<type> --help` for the flags each package type supports.
 
 ### Reuse credentials across multiple jobs
 
@@ -75,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: harness/setup-harness-cli@v2
-      - run: harness push artifact:python my-registry/my_pkg dist/my_pkg-1.0.0-py3-none-any.whl
+      - run: harness push artifact:python my-registry dist/my_pkg-1.0.0-py3-none-any.whl
 ```
 
 > Note: the CLI and the `har` plugin are cached by version, operating system, and architecture. Later jobs on the same runner type restore them from cache instead of downloading them again.

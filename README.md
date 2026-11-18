@@ -26,7 +26,7 @@ steps:
       project: my-project
 
   - name: Push artifact
-    run: harness push artifact:generic my-registry/my-app build.tar.gz --version ${{ github.sha }}
+    run: harness push artifact:generic my-registry/my-app build.tar.gz --version 1.0.0
 ```
 
 ## Examples

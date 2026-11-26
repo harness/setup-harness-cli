@@ -16,10 +16,10 @@ inputs:
     description: 'Harness PAT token. Always pass via a secret. Can also be set via the HARNESS_PAT_TOKEN environment variable.'
     required: false
   org:
-    description: 'Harness organization ID (required). Can also be set via the HARNESS_ORG_ID environment variable.'
+    description: 'Harness organization ID. Required: set this input or the HARNESS_ORG_ID environment variable; the step fails if neither is set.'
     required: false
   project:
-    description: 'Harness project ID (required). Can also be set via the HARNESS_PROJECT_ID environment variable.'
+    description: 'Harness project ID. Required: set this input or the HARNESS_PROJECT_ID environment variable; the step fails if neither is set.'
     required: false
   cli-version:
     description: 'Harness CLI release tag to install from harness/cli (e.g. v3.12.0). Defaults to latest.'

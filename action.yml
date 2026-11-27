@@ -1,5 +1,5 @@
 name: 'Setup Harness CLI'
-description: 'Install and authenticate the Harness CLI with the Artifact Registry (har) plugin so you can push and manage artifacts in subsequent steps.'
+description: 'Install and log in to the Harness CLI with the Artifact Registry (har) plugin to push and manage artifacts.'
 
 branding:
   icon: 'package'
